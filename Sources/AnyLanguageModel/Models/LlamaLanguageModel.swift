@@ -670,10 +670,14 @@ import Foundation
         private func createModelParams() -> llama_model_params {
             var params = llama_model_default_params()
 
-            // Partial GPU offload: 12/25 layers on GPU. Enough to cover
-            // roughly half the attention layers and SSM blocks without
-            // exceeding 4 GB Jetsam limits.
-            params.n_gpu_layers = 12
+            // All tests on iPhone 13 (A15, 4 GB):
+            //   n_gpu_layers =  0 → CPU mmap weights, GPU compute only. ✅
+            //   n_gpu_layers = 12 → flash_attn disabled (cross-device), OOM. ❌
+            //   n_gpu_layers = -1 → MTL KV + MTL weights, OOM. ❌
+            // Partial offload breaks Flash Attention when attention layers span
+            // CPU / GPU boundary (KV cache split across devices), causing a 4 GiB
+            // fallback allocation that exceeds Jetsam limit.
+            params.n_gpu_layers = 0
 
             // Try to reduce memory usage
             params.use_mmap = true
