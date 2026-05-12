@@ -670,12 +670,10 @@ import Foundation
         private func createModelParams() -> llama_model_params {
             var params = llama_model_default_params()
 
-            // Keep weights in CPU mmap (clean memory, excluded from Jetsam).
-            // GPU still accelerates compute via Metal (see ggml_metal_init).
-            // n_gpu_layers = -1 moves weights to GPU dirty memory and OOMs
-            // on 4 GB devices. Verified: iPhone 13 (A15) crashes with
-            // "Terminated due to memory issue" when all layers are offloaded.
-            params.n_gpu_layers = 0
+            // Partial GPU offload: 12/25 layers on GPU. Enough to cover
+            // roughly half the attention layers and SSM blocks without
+            // exceeding 4 GB Jetsam limits.
+            params.n_gpu_layers = 12
 
             // Try to reduce memory usage
             params.use_mmap = true
