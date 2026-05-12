@@ -136,6 +136,14 @@ import Foundation
             /// Mirostat sampling mode for adaptive perplexity control.
             public var mirostat: MirostatMode?
 
+            /// KV cache data type for keys (ggml_type, e.g. 1=f16, 8=q8_0, 2=q4_0).
+            /// nil means use the llama.cpp default (f16).
+            public var cacheTypeK: UInt32?
+
+            /// KV cache data type for values (ggml_type, e.g. 1=f16, 8=q8_0, 2=q4_0).
+            /// nil means use the llama.cpp default (f16). Requires flash_attn if not f16.
+            public var cacheTypeV: UInt32?
+
             /// Creates custom generation options for llama.cpp.
             public init(
                 contextSize: UInt32? = nil,
@@ -149,7 +157,9 @@ import Foundation
                 repeatLastN: Int32? = nil,
                 frequencyPenalty: Float? = nil,
                 presencePenalty: Float? = nil,
-                mirostat: MirostatMode? = nil
+                mirostat: MirostatMode? = nil,
+                cacheTypeK: UInt32? = nil,
+                cacheTypeV: UInt32? = nil
             ) {
                 self.contextSize = contextSize
                 self.batchSize = batchSize
@@ -163,7 +173,8 @@ import Foundation
                 self.frequencyPenalty = frequencyPenalty
                 self.presencePenalty = presencePenalty
                 self.mirostat = mirostat
-            }
+                self.cacheTypeK = cacheTypeK
+                self.cacheTypeV = cacheTypeV
 
             /// Default llama.cpp options used when none are provided at runtime.
             ///
@@ -322,6 +333,8 @@ import Foundation
             var mirostat: CustomGenerationOptions.MirostatMode?
             var sampling: GenerationOptions.SamplingMode?
             var maximumResponseTokens: Int?
+            var cacheTypeK: UInt32?
+            var cacheTypeV: UInt32?
 
             init(
                 contextSize: UInt32 = 2048,
@@ -337,7 +350,9 @@ import Foundation
                 presencePenalty: Float = 0.0,
                 mirostat: CustomGenerationOptions.MirostatMode? = nil,
                 sampling: GenerationOptions.SamplingMode? = nil,
-                maximumResponseTokens: Int? = nil
+                maximumResponseTokens: Int? = nil,
+                cacheTypeK: UInt32? = nil,
+                cacheTypeV: UInt32? = nil
             ) {
                 self.contextSize = contextSize
                 self.batchSize = batchSize
@@ -353,6 +368,8 @@ import Foundation
                 self.mirostat = mirostat
                 self.sampling = sampling
                 self.maximumResponseTokens = maximumResponseTokens
+                self.cacheTypeK = cacheTypeK
+                self.cacheTypeV = cacheTypeV
             }
 
             init(
@@ -389,7 +406,9 @@ import Foundation
                         presencePenalty: base.presencePenalty,
                         mirostat: base.mirostat,
                         sampling: sampling ?? base.sampling,
-                        maximumResponseTokens: maximumResponseTokens ?? base.maximumResponseTokens
+                        maximumResponseTokens: maximumResponseTokens ?? base.maximumResponseTokens,
+                        cacheTypeK: base.cacheTypeK,
+                        cacheTypeV: base.cacheTypeV
                     )
                     return
                 }
@@ -408,6 +427,8 @@ import Foundation
                 self.mirostat = options.mirostat ?? base.mirostat
                 self.sampling = sampling ?? base.sampling
                 self.maximumResponseTokens = maximumResponseTokens ?? base.maximumResponseTokens
+                self.cacheTypeK = options.cacheTypeK ?? base.cacheTypeK
+                self.cacheTypeV = options.cacheTypeV ?? base.cacheTypeV
             }
         }
 
@@ -677,6 +698,8 @@ import Foundation
             params.n_batch = options.batchSize
             params.n_threads = options.threads
             params.n_threads_batch = options.threads
+            if let kt = options.cacheTypeK { params.type_k = ggml_type(rawValue: kt) }
+            if let vt = options.cacheTypeV { params.type_v = ggml_type(rawValue: vt) }
             return params
         }
 
