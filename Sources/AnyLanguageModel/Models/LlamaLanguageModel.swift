@@ -1005,10 +1005,8 @@ import Foundation
             context: OpaquePointer,
             batchSize: UInt32
         ) throws -> Bool {
-            // Validate that prompt token count doesn't exceed batch capacity to prevent buffer overflow
-            guard promptTokens.count <= batchSize else {
-                throw LlamaLanguageModelError.insufficientMemory
-            }
+            // Prompt tokens are split into batchSize chunks below — no need to pre-check total count.
+            // The chunked decode loop handles arbitrarily long prompts.
 
             let hasEncoder = llama_model_has_encoder(model)
             let hasDecoder = llama_model_has_decoder(model)
@@ -1057,25 +1055,30 @@ import Foundation
                     throw LlamaLanguageModelError.encoderOnlyModel
                 }
             } else {
-                // Standard decoder-only model (most LLMs)
-                batch.n_tokens = Int32(promptTokens.count)
-                for i in 0 ..< promptTokens.count {
-                    let idx = Int(i)
-                    batch.token[idx] = promptTokens[idx]
-                    batch.pos[idx] = Int32(i)
-                    batch.n_seq_id[idx] = 1
-                    if let seq_ids = batch.seq_id, let seq_id = seq_ids[idx] {
-                        seq_id[0] = 0
+                // Standard decoder-only model (most LLMs).
+                // Chunked decode: split prompt tokens into batchSize chunks to avoid
+                // overflow on long-context models. Only the very last token gets logits=1.
+                var offset = 0
+                while offset < promptTokens.count {
+                    let remaining = promptTokens.count - offset
+                    let chunk = min(Int(batchSize), remaining)
+                    batch.n_tokens = Int32(chunk)
+
+                    for i in 0 ..< chunk {
+                        let idx = offset + i
+                        batch.token[i] = promptTokens[idx]
+                        batch.pos[i] = Int32(idx)
+                        batch.n_seq_id[i] = 1
+                        if let seq_ids = batch.seq_id, let seq_id = seq_ids[i] {
+                            seq_id[0] = 0
+                        }
+                        batch.logits[i] = (idx == promptTokens.count - 1) ? 1 : 0
                     }
-                    batch.logits[idx] = 0
-                }
 
-                if batch.n_tokens > 0 {
-                    batch.logits[Int(batch.n_tokens) - 1] = 1
-                }
-
-                guard llama_decode(context, batch) == 0 else {
-                    throw LlamaLanguageModelError.decodingFailed
+                    guard llama_decode(context, batch) == 0 else {
+                        throw LlamaLanguageModelError.decodingFailed
+                    }
+                    offset += chunk
                 }
             }
 
