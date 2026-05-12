@@ -670,8 +670,8 @@ import Foundation
         private func createModelParams() -> llama_model_params {
             var params = llama_model_default_params()
 
-            // Force CPU-only execution to avoid Metal GPU issues
-            params.n_gpu_layers = 0
+            // Offload all layers to GPU for Metal-accelerated inference
+            params.n_gpu_layers = -1
 
             // Try to reduce memory usage
             params.use_mmap = true
