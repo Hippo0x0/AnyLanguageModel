@@ -175,6 +175,7 @@ import Foundation
                 self.mirostat = mirostat
                 self.cacheTypeK = cacheTypeK
                 self.cacheTypeV = cacheTypeV
+            }
 
             /// Default llama.cpp options used when none are provided at runtime.
             ///
