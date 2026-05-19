@@ -644,6 +644,16 @@ extension LanguageModelSession {
     }
 }
 
+// MARK: - Embedding
+
+extension LanguageModelSession {
+    /// Generate an embedding vector for the given text.
+    /// Delegates to the underlying model's `embed` method.
+    public func embed(_ text: String, options: GenerationOptions = .init()) async throws -> [Float] {
+        try await model.embed(text, options: options)
+    }
+}
+
 // MARK: -
 
 extension LanguageModelSession {

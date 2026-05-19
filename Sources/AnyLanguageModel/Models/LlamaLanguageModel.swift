@@ -712,6 +712,84 @@ import Foundation
             return LanguageModelSession.ResponseStream(stream: stream)
         }
 
+        // MARK: - Embedding
+
+        /// Generate an embedding vector for the given text using the loaded model.
+        ///
+        /// Configures the llama context for bidirectional (non-causal) attention with mean pooling,
+        /// runs a forward pass via `llama_decode`, and extracts the pooled embedding via
+        /// `llama_get_embeddings_seq`.
+        public func embed(_ text: String, options: GenerationOptions) async throws -> [Float] {
+            try await ensureModelLoaded()
+            guard let model = self.model, let vocab = self.vocab else {
+                throw LlamaLanguageModelError.modelLoadFailed
+            }
+
+            let runtimeOptions = resolvedOptions(from: options)
+            var ctxParams = createContextParams(from: runtimeOptions)
+
+            // Configure for embedding: bidirectional attention + mean pooling
+            ctxParams.embeddings     = true
+            ctxParams.pooling_type   = LLAMA_POOLING_TYPE_MEAN
+            ctxParams.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL
+
+            guard let ctx = llama_init_from_model(model, ctxParams) else {
+                throw LlamaLanguageModelError.contextInitializationFailed
+            }
+            defer { llama_free(ctx) }
+
+            llama_set_n_threads(ctx, runtimeOptions.threads, runtimeOptions.threads)
+
+            // Tokenize
+            let maxTokens = Int(ctxParams.n_ctx)
+            let tokens = [llama_token](unsafeUninitializedCapacity: maxTokens) { buf, count in
+                count = Int(llama_tokenize(
+                    vocab, text, Int32(text.utf8.count),
+                    buf.baseAddress, Int32(maxTokens), true, false
+                ))
+            }
+            guard !tokens.isEmpty else {
+                throw LlamaLanguageModelError.embeddingFailed("tokenization returned 0 tokens")
+            }
+
+            // Build batch for forward pass (no logits needed)
+            let nTokens = Int32(tokens.count)
+            var batch = llama_batch_init(nTokens, 0, 1)
+            defer { llama_batch_free(batch) }
+
+            for i in 0..<Int(nTokens) {
+                batch.token[i]      = tokens[i]
+                batch.pos[i]        = Int32(i)
+                batch.n_seq_id[i]   = 1
+                batch.seq_id[i]?.pointee = 0
+                batch.logits[i]     = 0
+            }
+
+            // Decode (forward pass)
+            let ret = llama_decode(ctx, batch)
+            guard ret == 0 else {
+                throw LlamaLanguageModelError.embeddingFailed("llama_decode returned \(ret)")
+            }
+
+            // Extract pooled embedding
+            guard let embPtr = llama_get_embeddings_seq(ctx, 0) else {
+                throw LlamaLanguageModelError.embeddingFailed("llama_get_embeddings_seq returned nil")
+            }
+
+            let nEmbd = Int(llama_model_n_embd(model))
+            let vector = Array(UnsafeBufferPointer(start: embPtr, count: nEmbd))
+
+            return normalize(vector)
+        }
+
+        /// L2-normalize a float vector to unit length.
+        private func normalize(_ vec: [Float]) -> [Float] {
+            let squaredSum = vec.reduce(0) { $0 + $1 * $1 }
+            let norm = sqrt(squaredSum)
+            guard norm > 0 else { return vec }
+            return vec.map { $0 / norm }
+        }
+
         // MARK: - Private Helpers
 
         private func ensureModelLoaded() async throws {
@@ -1683,6 +1761,7 @@ import Foundation
         case insufficientMemory
         case unsupportedFeature
         case encoderOnlyModel
+        case embeddingFailed(String)
         case missingMultimodalProjector
         case invalidMultimodalProjectorPath
         case multimodalProjectorLoadFailed
@@ -1707,6 +1786,8 @@ import Foundation
                 return "This LlamaLanguageModel does not support the requested multimodal input"
             case .encoderOnlyModel:
                 return "This model is encoder-only (e.g., BERT) and cannot generate text"
+            case .embeddingFailed(let msg):
+                return "Embedding failed: \(msg)"
             case .missingMultimodalProjector:
                 return "Image input requires a multimodal projector (mmproj) path"
             case .invalidMultimodalProjectorPath:
