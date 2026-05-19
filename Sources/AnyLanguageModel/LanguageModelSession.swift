@@ -652,6 +652,12 @@ extension LanguageModelSession {
     public func embed(_ text: String, options: GenerationOptions = .init()) async throws -> [Float] {
         try await model.embed(text, options: options)
     }
+
+    /// Generate an embedding vector for an image.
+    /// Delegates to the underlying model's `embedImage` method.
+    public func embedImage(_ imageData: Data, options: GenerationOptions = .init()) async throws -> [Float] {
+        try await model.embedImage(imageData, options: options)
+    }
 }
 
 // MARK: -

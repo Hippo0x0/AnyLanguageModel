@@ -44,6 +44,17 @@ public protocol LanguageModel: Sendable {
     /// Embedding models output a fixed-length float vector representing semantic meaning.
     /// Models that don't support embedding throw ``EmbeddingError/notSupported``.
     func embed(_ text: String, options: GenerationOptions) async throws -> [Float]
+
+    /// Generate an embedding vector for an image.
+    /// Uses the vision encoder (mmproj) to extract visual features, then pools
+    /// the LLM-processed hidden states into a fixed-length vector.
+    /// The output dimension equals the LLM's hidden dimension, not the text embedding dimension.
+    func embedImage(_ imageData: Data, options: GenerationOptions) async throws -> [Float]
+
+    /// The dimension of the embedding vectors produced by this model.
+    /// For text embedding models, this is the output dimension (e.g. 768).
+    /// For multimodal models, this is the LLM hidden dimension (e.g. 896 for Qwen3-0.8B).
+    var embeddingDimension: Int { get }
 }
 
 // MARK: - Default Implementation
@@ -76,6 +87,12 @@ extension LanguageModel {
     public func embed(_ text: String, options: GenerationOptions) async throws -> [Float] {
         throw EmbeddingError.notSupported
     }
+
+    public func embedImage(_ imageData: Data, options: GenerationOptions) async throws -> [Float] {
+        throw EmbeddingError.notSupported
+    }
+
+    public var embeddingDimension: Int { 0 }
 }
 
 extension LanguageModel where UnavailableReason == Never {

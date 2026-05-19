@@ -782,6 +782,108 @@ import Foundation
             return normalize(vector)
         }
 
+        /// Generate an embedding vector for an image using the vision encoder.
+        ///
+        /// Creates a dedicated embedding context with bidirectional attention and mean pooling,
+        /// processes the image through the multimodal projector (mmproj), and extracts the
+        /// pooled hidden states from the LLM's final layer.
+        ///
+        /// The output dimension matches the LLM's hidden dimension (e.g. 896 for Qwen3-0.8B),
+        /// which is different from the text embedding model dimension (768 for EmbeddingGemma-300M).
+        public func embedImage(_ imageData: Data, options: GenerationOptions) async throws -> [Float] {
+            try await ensureModelLoaded()
+            guard let model = self.model else { throw LlamaLanguageModelError.modelLoadFailed }
+
+            let runtimeOptions = resolvedOptions(from: options)
+            guard let mmprojPath = runtimeOptions.mmprojPath, !mmprojPath.isEmpty else {
+                throw LlamaLanguageModelError.missingMultimodalProjector
+            }
+            guard FileManager.default.fileExists(atPath: mmprojPath) else {
+                throw LlamaLanguageModelError.invalidMultimodalProjectorPath
+            }
+
+            // Create embedding-specific context (bidirectional + mean pooling)
+            var ctxParams = createContextParams(from: runtimeOptions)
+            ctxParams.embeddings     = true
+            ctxParams.pooling_type   = LLAMA_POOLING_TYPE_MEAN
+            ctxParams.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL
+
+            guard let ctx = llama_init_from_model(model, ctxParams) else {
+                throw LlamaLanguageModelError.contextInitializationFailed
+            }
+            defer { llama_free(ctx) }
+
+            llama_set_n_threads(ctx, runtimeOptions.threads, runtimeOptions.threads)
+
+            // Initialize multimodal projector
+            var mtmdParams = mtmd_context_params_default()
+            mtmdParams.use_gpu = runtimeOptions.mmprojUseGPU
+            mtmdParams.print_timings = false
+            mtmdParams.n_threads = runtimeOptions.threads
+            mtmdParams.image_min_tokens = runtimeOptions.imageMinTokens ?? -1
+            mtmdParams.image_max_tokens = runtimeOptions.imageMaxTokens ?? -1
+
+            let mediaMarker = runtimeOptions.mediaMarker
+            let mtmdContext: OpaquePointer? = mediaMarker.withCString { marker in
+                mtmdParams.media_marker = marker
+                return mmprojPath.withCString { mtmd_init_from_file($0, model, mtmdParams) }
+            }
+            guard let mtmdContext else { throw LlamaLanguageModelError.multimodalProjectorLoadFailed }
+            defer { mtmd_free(mtmdContext) }
+
+            // Load image as bitmap
+            let bitmap = imageData.withUnsafeBytes { rawBuffer -> OpaquePointer? in
+                guard let baseAddress = rawBuffer.baseAddress else { return nil }
+                return mtmd_helper_bitmap_init_from_buf(
+                    mtmdContext,
+                    baseAddress.assumingMemoryBound(to: UInt8.self),
+                    imageData.count
+                )
+            }
+            guard let bitmap else { throw LlamaLanguageModelError.encodingFailed }
+            defer { mtmd_bitmap_free(bitmap) }
+
+            // Tokenize: single media marker replaced with image tokens
+            guard let chunks = mtmd_input_chunks_init() else {
+                throw LlamaLanguageModelError.encodingFailed
+            }
+            defer { mtmd_input_chunks_free(chunks) }
+
+            var inputText = mediaMarker.withCString { mtmd_input_text(text: $0, add_special: true, parse_special: true) }
+            var bitmapPointers = [Optional(bitmap)]
+            let tokenizeResult = bitmapPointers.withUnsafeMutableBufferPointer { buf in
+                mtmd_tokenize(mtmdContext, chunks, &inputText, buf.baseAddress, buf.count)
+            }
+            guard tokenizeResult == 0 else { throw LlamaLanguageModelError.encodingFailed }
+
+            // Process through vision encoder + LLM
+            var nPast: llama_pos = 0
+            let evalResult = mtmd_helper_eval_chunks(
+                mtmdContext, ctx, chunks,
+                0, 0, Int32(runtimeOptions.batchSize), true, &nPast
+            )
+            guard evalResult == 0 else {
+                throw LlamaLanguageModelError.embeddingFailed("mtmd eval returned \(evalResult)")
+            }
+
+            // Extract pooled embedding (mean over image tokens + marker)
+            guard let embPtr = llama_get_embeddings_seq(ctx, 0) else {
+                throw LlamaLanguageModelError.embeddingFailed("llama_get_embeddings_seq returned nil")
+            }
+
+            let nEmbd = Int(llama_model_n_embd(model))
+            let vector = Array(UnsafeBufferPointer(start: embPtr, count: nEmbd))
+            return normalize(vector)
+        }
+
+        /// The embedding dimension of this model's output vectors.
+        /// For Qwen3-0.8B this is 896 (LLM hidden dim), which differs from
+        /// text embedding models like EmbeddingGemma-300M (768).
+        public var embeddingDimension: Int {
+            guard let model = model else { return 0 }
+            return Int(llama_model_n_embd(model))
+        }
+
         /// L2-normalize a float vector to unit length.
         private func normalize(_ vec: [Float]) -> [Float] {
             let squaredSum = vec.reduce(0) { $0 + $1 * $1 }
