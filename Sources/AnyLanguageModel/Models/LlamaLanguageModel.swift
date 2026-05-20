@@ -1782,9 +1782,13 @@ import Foundation
                 throw LlamaLanguageModelError.encodingFailed
             }
 
-            return buffer.withUnsafeBytes { rawBuffer in
+            let formatted = buffer.withUnsafeBytes { rawBuffer in
                 String(decoding: rawBuffer.prefix(Int(result)), as: UTF8.self)
             }
+            // DEBUG: log suffix to verify template output
+            let suffix = String(formatted.suffix(200))
+            print("[formatPrompt] suffix(200): \(suffix.debugDescription)")
+            return formatted
         }
 
         private func applyChatTemplate(to messages: [(role: String, content: String)]) throws -> String {
