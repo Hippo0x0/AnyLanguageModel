@@ -159,6 +159,10 @@ import Foundation
             /// Whether the multimodal projector should use GPU acceleration when available.
             public var mmprojUseGPU: Bool?
 
+            /// Token IDs to ban during generation (logit set to -inf).
+            /// Use this to suppress specific tokens, e.g. `[151667]` to ban Qwen3 `<think>`.
+            public var bannedTokens: [llama_token]?
+
             /// Creates custom generation options for llama.cpp.
             public init(
                 contextSize: UInt32? = nil,
@@ -179,7 +183,8 @@ import Foundation
                 mediaMarker: String? = nil,
                 imageMinTokens: Int32? = nil,
                 imageMaxTokens: Int32? = nil,
-                mmprojUseGPU: Bool? = nil
+                mmprojUseGPU: Bool? = nil,
+                bannedTokens: [llama_token]? = nil
             ) {
                 self.contextSize = contextSize
                 self.batchSize = batchSize
@@ -200,6 +205,7 @@ import Foundation
                 self.imageMinTokens = imageMinTokens
                 self.imageMaxTokens = imageMaxTokens
                 self.mmprojUseGPU = mmprojUseGPU
+                self.bannedTokens = bannedTokens
             }
 
             /// Default llama.cpp options used when none are provided at runtime.
@@ -369,6 +375,7 @@ import Foundation
             var imageMinTokens: Int32?
             var imageMaxTokens: Int32?
             var mmprojUseGPU: Bool
+            var bannedTokens: [llama_token]?
 
             init(
                 contextSize: UInt32 = 2048,
@@ -391,7 +398,8 @@ import Foundation
                 mediaMarker: String = String(cString: mtmd_default_marker()),
                 imageMinTokens: Int32? = nil,
                 imageMaxTokens: Int32? = nil,
-                mmprojUseGPU: Bool = true
+                mmprojUseGPU: Bool = true,
+                bannedTokens: [llama_token]? = nil
             ) {
                 self.contextSize = contextSize
                 self.batchSize = batchSize
@@ -414,6 +422,7 @@ import Foundation
                 self.imageMinTokens = imageMinTokens
                 self.imageMaxTokens = imageMaxTokens
                 self.mmprojUseGPU = mmprojUseGPU
+                self.bannedTokens = bannedTokens
             }
 
             init(
@@ -457,7 +466,8 @@ import Foundation
                         mediaMarker: base.mediaMarker,
                         imageMinTokens: base.imageMinTokens,
                         imageMaxTokens: base.imageMaxTokens,
-                        mmprojUseGPU: base.mmprojUseGPU
+                        mmprojUseGPU: base.mmprojUseGPU,
+                        bannedTokens: base.bannedTokens
                     )
                     return
                 }
@@ -483,6 +493,7 @@ import Foundation
                 self.imageMinTokens = options.imageMinTokens ?? base.imageMinTokens
                 self.imageMaxTokens = options.imageMaxTokens ?? base.imageMaxTokens
                 self.mmprojUseGPU = options.mmprojUseGPU ?? base.mmprojUseGPU
+                self.bannedTokens = options.bannedTokens ?? base.bannedTokens
             }
         }
 
@@ -969,6 +980,18 @@ import Foundation
             effectiveTemperature: Float,
             options: ResolvedGenerationOptions
         ) {
+            // Ban specified tokens by setting their logits to -inf (e.g. <think> token 151667).
+            if let bannedTokens = options.bannedTokens, !bannedTokens.isEmpty, let vocab = self.vocab {
+                let nVocab = llama_n_vocab(vocab)
+                let biases = bannedTokens.map { llama_logit_bias(token: $0, bias: -Float.infinity) }
+                biases.withUnsafeBufferPointer { ptr in
+                    llama_sampler_chain_add(
+                        sampler,
+                        llama_sampler_init_logit_bias(nVocab, Int32(biases.count), ptr.baseAddress)
+                    )
+                }
+            }
+
             if let mirostat = options.mirostat {
                 llama_sampler_chain_add(sampler, llama_sampler_init_temp(effectiveTemperature))
 
