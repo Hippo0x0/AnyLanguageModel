@@ -79,6 +79,15 @@ import Foundation
         /// )
         /// ```
         public struct CustomGenerationOptions: AnyLanguageModel.CustomGenerationOptions, Codable {
+            public enum ThinkingMode: String, Codable, Sendable {
+                /// Preserve the model template's no-thinking behavior.
+                case disabled
+                /// Allow the model to decide whether to emit `<think>`.
+                case auto
+                /// Force generation to start inside a `<think>` block.
+                case forced
+            }
+
             /// Context size to allocate for the model.
             public var contextSize: UInt32?
 
@@ -159,6 +168,17 @@ import Foundation
             /// Whether the multimodal projector should use GPU acceleration when available.
             public var mmprojUseGPU: Bool?
 
+            /// Token IDs to ban during generation (logit set to -inf).
+            /// Use this to suppress specific tokens, e.g. `[151667]` to ban Qwen3 `<think>`.
+            public var bannedTokens: [llama_token]?
+
+            /// When true, strip the empty `<think>\n\n</think>\n\n` pre-filled by the chat template,
+            /// allowing the model to generate its own reasoning blocks. Default nil (let template decide).
+            public var enableThinking: Bool?
+
+            /// Explicit Qwen-style thinking policy. Overrides `enableThinking` when set.
+            public var thinkingMode: ThinkingMode?
+
             /// Creates custom generation options for llama.cpp.
             public init(
                 contextSize: UInt32? = nil,
@@ -179,7 +199,10 @@ import Foundation
                 mediaMarker: String? = nil,
                 imageMinTokens: Int32? = nil,
                 imageMaxTokens: Int32? = nil,
-                mmprojUseGPU: Bool? = nil
+                mmprojUseGPU: Bool? = nil,
+                bannedTokens: [llama_token]? = nil,
+                enableThinking: Bool? = nil,
+                thinkingMode: ThinkingMode? = nil
             ) {
                 self.contextSize = contextSize
                 self.batchSize = batchSize
@@ -200,6 +223,9 @@ import Foundation
                 self.imageMinTokens = imageMinTokens
                 self.imageMaxTokens = imageMaxTokens
                 self.mmprojUseGPU = mmprojUseGPU
+                self.bannedTokens = bannedTokens
+                self.enableThinking = enableThinking
+                self.thinkingMode = thinkingMode
             }
 
             /// Default llama.cpp options used when none are provided at runtime.
@@ -369,6 +395,9 @@ import Foundation
             var imageMinTokens: Int32?
             var imageMaxTokens: Int32?
             var mmprojUseGPU: Bool
+            var bannedTokens: [llama_token]?
+            var enableThinking: Bool
+            var thinkingMode: CustomGenerationOptions.ThinkingMode
 
             init(
                 contextSize: UInt32 = 2048,
@@ -391,7 +420,10 @@ import Foundation
                 mediaMarker: String = String(cString: mtmd_default_marker()),
                 imageMinTokens: Int32? = nil,
                 imageMaxTokens: Int32? = nil,
-                mmprojUseGPU: Bool = true
+                mmprojUseGPU: Bool = true,
+                bannedTokens: [llama_token]? = nil,
+                enableThinking: Bool = false,
+                thinkingMode: CustomGenerationOptions.ThinkingMode = .disabled
             ) {
                 self.contextSize = contextSize
                 self.batchSize = batchSize
@@ -414,6 +446,9 @@ import Foundation
                 self.imageMinTokens = imageMinTokens
                 self.imageMaxTokens = imageMaxTokens
                 self.mmprojUseGPU = mmprojUseGPU
+                self.bannedTokens = bannedTokens
+                self.enableThinking = enableThinking
+                self.thinkingMode = thinkingMode
             }
 
             init(
@@ -457,7 +492,10 @@ import Foundation
                         mediaMarker: base.mediaMarker,
                         imageMinTokens: base.imageMinTokens,
                         imageMaxTokens: base.imageMaxTokens,
-                        mmprojUseGPU: base.mmprojUseGPU
+                        mmprojUseGPU: base.mmprojUseGPU,
+                        bannedTokens: base.bannedTokens,
+                        enableThinking: base.enableThinking,
+                        thinkingMode: base.thinkingMode
                     )
                     return
                 }
@@ -483,6 +521,10 @@ import Foundation
                 self.imageMinTokens = options.imageMinTokens ?? base.imageMinTokens
                 self.imageMaxTokens = options.imageMaxTokens ?? base.imageMaxTokens
                 self.mmprojUseGPU = options.mmprojUseGPU ?? base.mmprojUseGPU
+                self.bannedTokens = options.bannedTokens ?? base.bannedTokens
+                self.enableThinking = options.enableThinking ?? base.enableThinking
+                self.thinkingMode = options.thinkingMode
+                    ?? (options.enableThinking == true ? .auto : base.thinkingMode)
             }
         }
 
@@ -600,7 +642,9 @@ import Foundation
                     options: runtimeOptions
                 )
             } else {
-                let fullPrompt = try formatPrompt(for: session)
+                var fullPrompt = try formatPrompt(for: session)
+                let thinkingPrefix: String
+                (fullPrompt, thinkingPrefix) = applyThinkingMode(runtimeOptions.thinkingMode, to: fullPrompt)
                 text = try await generateText(
                     context: context,
                     model: model!,
@@ -608,6 +652,13 @@ import Foundation
                     maxTokens: maxTokens,
                     options: runtimeOptions
                 )
+                if !thinkingPrefix.isEmpty {
+                    return LanguageModelSession.Response(
+                        content: (thinkingPrefix + text) as! Content,
+                        rawContent: GeneratedContent(thinkingPrefix + text),
+                        transcriptEntries: ArraySlice([])
+                    )
+                }
             }
 
             return LanguageModelSession.Response(
@@ -674,7 +725,17 @@ import Foundation
                                         options: runtimeOptions
                                     )
                                 } else {
-                                    let fullPrompt = try self.formatPrompt(for: session)
+                                    var fullPrompt = try self.formatPrompt(for: session)
+                                    let thinkingPrefix: String
+                                    (fullPrompt, thinkingPrefix) = self.applyThinkingMode(runtimeOptions.thinkingMode, to: fullPrompt)
+                                    if !thinkingPrefix.isEmpty {
+                                        accumulatedText = thinkingPrefix
+                                        let snapshot = LanguageModelSession.ResponseStream<Content>.Snapshot(
+                                            content: (accumulatedText as! Content).asPartiallyGenerated(),
+                                            rawContent: GeneratedContent(accumulatedText)
+                                        )
+                                        continuation.yield(snapshot)
+                                    }
                                     tokenStream = generateTextStream(
                                         context: context,
                                         model: model!,
@@ -969,6 +1030,18 @@ import Foundation
             effectiveTemperature: Float,
             options: ResolvedGenerationOptions
         ) {
+            // Ban specified tokens by setting their logits to -inf (e.g. <think> token 151667).
+            if let bannedTokens = options.bannedTokens, !bannedTokens.isEmpty, let vocab = self.vocab {
+                let nVocab = llama_n_vocab(vocab)
+                let biases = bannedTokens.map { llama_logit_bias(token: $0, bias: -Float.infinity) }
+                biases.withUnsafeBufferPointer { ptr in
+                    llama_sampler_chain_add(
+                        sampler,
+                        llama_sampler_init_logit_bias(nVocab, Int32(biases.count), ptr.baseAddress)
+                    )
+                }
+            }
+
             if let mirostat = options.mirostat {
                 llama_sampler_chain_add(sampler, llama_sampler_init_temp(effectiveTemperature))
 
@@ -1306,7 +1379,7 @@ import Foundation
                 throw LlamaLanguageModelError.invalidMultimodalProjectorPath
             }
 
-            let multimodalPrompt = try formatMultimodalPrompt(for: session, mediaMarker: options.mediaMarker)
+            let multimodalPrompt = try formatMultimodalPrompt(for: session, mediaMarker: options.mediaMarker, thinkingMode: options.thinkingMode)
             guard multimodalPrompt.images.isEmpty == false else {
                 throw LlamaLanguageModelError.unsupportedFeature
             }
@@ -1395,7 +1468,11 @@ import Foundation
             return bitmap
         }
 
-        private func formatMultimodalPrompt(for session: LanguageModelSession, mediaMarker: String) throws -> MultimodalPrompt {
+        private func formatMultimodalPrompt(
+            for session: LanguageModelSession,
+            mediaMarker: String,
+            thinkingMode: CustomGenerationOptions.ThinkingMode = .disabled
+        ) throws -> MultimodalPrompt {
             try ensureModelLoadedForTemplate()
 
             var messages: [(role: String, content: String)] = []
@@ -1423,7 +1500,8 @@ import Foundation
                 }
             }
 
-            let formatted = try applyChatTemplate(to: messages)
+            var formatted = try applyChatTemplate(to: messages)
+            formatted = applyThinkingMode(thinkingMode, to: formatted).prompt
             return MultimodalPrompt(text: formatted, images: images)
         }
 
@@ -1778,6 +1856,30 @@ import Foundation
 
             return buffer.withUnsafeBytes { rawBuffer in
                 String(decoding: rawBuffer.prefix(Int(result)), as: UTF8.self)
+            }
+        }
+
+        /// Strip the pre-filled empty think block that Qwen3.5 templates insert when
+        /// thinking is disabled, so the model can generate its own `<think>` block.
+        private func stripEmptyThinkBlock(_ prompt: String) -> String {
+            let suffix = "<think>\n\n</think>\n\n"
+            if prompt.hasSuffix(suffix) {
+                return String(prompt.dropLast(suffix.count))
+            }
+            return prompt
+        }
+
+        private func applyThinkingMode(
+            _ mode: CustomGenerationOptions.ThinkingMode,
+            to prompt: String
+        ) -> (prompt: String, generatedPrefix: String) {
+            switch mode {
+            case .disabled:
+                return (prompt, "")
+            case .auto:
+                return (stripEmptyThinkBlock(prompt), "")
+            case .forced:
+                return (stripEmptyThinkBlock(prompt) + "<think>\n", "<think>\n")
             }
         }
 
