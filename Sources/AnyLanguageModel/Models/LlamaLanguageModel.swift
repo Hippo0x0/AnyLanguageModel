@@ -979,7 +979,24 @@ import Foundation
 
             self.model = loadedModel
             self.vocab = llama_model_get_vocab(loadedModel)
+            if let vocab = self.vocab {
+                let samples = ["<think>", "</think>", "<think>\n\n</think>\n\n"]
+                for sample in samples {
+                    if let tokenIds = try? tokenizeText(vocab: vocab, text: sample) {
+                        print("[ThinkingDebug][Llama] sample=\"\(sample.replacingOccurrences(of: "\n", with: "\\n"))\" tokens=\(tokenIds)")
+                    }
+                }
+            }
             self.isModelLoaded = true
+        }
+
+        /// Tokenize text using the currently loaded model vocabulary.
+        public func tokenIDs(for text: String) async throws -> [llama_token] {
+            try await ensureModelLoaded()
+            guard let vocab = self.vocab else {
+                throw LlamaLanguageModelError.modelLoadFailed
+            }
+            return try tokenizeText(vocab: vocab, text: text)
         }
 
         private func createModelParams() -> llama_model_params {
