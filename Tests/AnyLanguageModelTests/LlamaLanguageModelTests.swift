@@ -4,6 +4,100 @@ import Testing
 @testable import AnyLanguageModel
 
 #if Llama
+    @Suite("LlamaLanguageModel multimodal configuration")
+    struct LlamaLanguageModelMultimodalConfigurationTests {
+        @Test func initializerStoresProjectorPath() {
+            let model = LlamaLanguageModel(
+                modelPath: "/models/text.gguf",
+                mmprojPath: "/models/mmproj.gguf"
+            )
+
+            #expect(model.modelPath == "/models/text.gguf")
+            #expect(model.mmprojPath == "/models/mmproj.gguf")
+        }
+
+        @Test func customGenerationOptionsCarryMultimodalSettings() {
+            var options = GenerationOptions()
+            let custom = LlamaLanguageModel.CustomGenerationOptions(
+                mmprojPath: "/override/mmproj.gguf",
+                mediaMarker: "<image>",
+                imageMinTokens: 16,
+                imageMaxTokens: 1024,
+                mmprojUseGPU: false
+            )
+            options[custom: LlamaLanguageModel.self] = custom
+
+            let retrieved = options[custom: LlamaLanguageModel.self]
+            #expect(retrieved?.mmprojPath == "/override/mmproj.gguf")
+            #expect(retrieved?.mediaMarker == "<image>")
+            #expect(retrieved?.imageMinTokens == 16)
+            #expect(retrieved?.imageMaxTokens == 1024)
+            #expect(retrieved?.mmprojUseGPU == false)
+        }
+
+        @Test func imageInputWithoutProjectorThrowsMissingProjectorBeforeModelLoad() async throws {
+            let model = LlamaLanguageModel(modelPath: "/missing/text.gguf")
+            let session = LanguageModelSession(model: model)
+            let image = Transcript.ImageSegment(data: Data([0x89, 0x50, 0x4E, 0x47]), mimeType: "image/png")
+
+            do {
+                _ = try await session.respond(to: "Describe this image", image: image)
+                Issue.record("Expected missing projector error")
+            } catch let error as LlamaLanguageModelError {
+                #expect(error == .missingMultimodalProjector)
+            }
+        }
+
+        @Test func multimodalPromptContentPreservesImageOrderWithMarkers() {
+            let first = Transcript.ImageSegment(data: Data([1]), mimeType: "image/png")
+            let second = Transcript.ImageSegment(data: Data([2]), mimeType: "image/png")
+            let segments: [Transcript.Segment] = [
+                .text(.init(content: "before ")),
+                .image(first),
+                .text(.init(content: " between ")),
+                .image(second),
+                .text(.init(content: " after")),
+            ]
+
+            let result = LlamaLanguageModel.multimodalPromptContent(from: segments, mediaMarker: "<__media__>")
+
+            #expect(result.text == "before <__media__> between <__media__> after")
+            #expect(result.images == [first, second])
+        }
+    }
+
+    @Suite(
+        "LlamaLanguageModel multimodal runtime",
+        .serialized,
+        .enabled(if: ProcessInfo.processInfo.environment["LLAMA_MODEL_PATH"] != nil
+            && ProcessInfo.processInfo.environment["LLAMA_MMPROJ_PATH"] != nil)
+    )
+    struct LlamaLanguageModelMultimodalRuntimeTests {
+        @Test func imageInputUsesProjector() async throws {
+            let model = LlamaLanguageModel(
+                modelPath: ProcessInfo.processInfo.environment["LLAMA_MODEL_PATH"]!,
+                mmprojPath: ProcessInfo.processInfo.environment["LLAMA_MMPROJ_PATH"]!
+            )
+            let session = LanguageModelSession(model: model)
+            let image = Transcript.ImageSegment(data: Self.onePixelPNG, mimeType: "image/png")
+            let options = GenerationOptions(maximumResponseTokens: 1)
+
+            _ = try await session.respond(to: "Describe this image in one word.", image: image, options: options)
+        }
+
+        private static let onePixelPNG = Data([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+            0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,
+            0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
+            0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
+            0x44, 0xAE, 0x42, 0x60, 0x82,
+        ])
+    }
+
     @Suite(
         "LlamaLanguageModel",
         .serialized,

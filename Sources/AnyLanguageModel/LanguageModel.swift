@@ -39,6 +39,22 @@ public protocol LanguageModel: Sendable {
         issues: [LanguageModelFeedback.Issue],
         desiredOutput: Transcript.Entry?
     ) -> Data
+
+    /// Generate an embedding vector for the given text.
+    /// Embedding models output a fixed-length float vector representing semantic meaning.
+    /// Models that don't support embedding throw ``EmbeddingError/notSupported``.
+    func embed(_ text: String, options: GenerationOptions) async throws -> [Float]
+
+    /// Generate an embedding vector for an image.
+    /// Uses the vision encoder (mmproj) to extract visual features, then pools
+    /// the LLM-processed hidden states into a fixed-length vector.
+    /// The output dimension equals the LLM's hidden dimension, not the text embedding dimension.
+    func embedImage(_ imageData: Data, options: GenerationOptions) async throws -> [Float]
+
+    /// The dimension of the embedding vectors produced by this model.
+    /// For text embedding models, this is the output dimension (e.g. 768).
+    /// For multimodal models, this is the LLM hidden dimension (e.g. 896 for Qwen3-0.8B).
+    var embeddingDimension: Int { get }
 }
 
 // MARK: - Default Implementation
@@ -67,10 +83,38 @@ extension LanguageModel {
     ) -> Data {
         return Data()
     }
+
+    public func embed(_ text: String, options: GenerationOptions) async throws -> [Float] {
+        throw EmbeddingError.notSupported
+    }
+
+    public func embedImage(_ imageData: Data, options: GenerationOptions) async throws -> [Float] {
+        throw EmbeddingError.notSupported
+    }
+
+    public var embeddingDimension: Int { 0 }
 }
 
 extension LanguageModel where UnavailableReason == Never {
     public var availability: Availability<UnavailableReason> {
         return .available
+    }
+}
+
+// MARK: - EmbeddingError
+
+public enum EmbeddingError: LocalizedError {
+    case notSupported
+    case modelNotLoaded
+    case tokenizationFailed(String)
+    case decodeFailed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .notSupported: return "This model does not support embedding"
+        case .modelNotLoaded: return "Model is not loaded"
+        case .tokenizationFailed(let msg): return "Tokenization failed: \(msg)"
+        case .decodeFailed(let msg): return "Decode failed: \(msg)"
+        }
     }
 }
