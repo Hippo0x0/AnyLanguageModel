@@ -1112,6 +1112,14 @@ import Foundation
             llama_sampler_chain_add(sampler, llama_sampler_init_dist(options.seed))
         }
 
+        private struct SendableOpaquePointer: @unchecked Sendable {
+            let value: OpaquePointer
+
+            init(_ value: OpaquePointer) {
+                self.value = value
+            }
+        }
+
         private func generateText(
             context: OpaquePointer,
             model: OpaquePointer,
@@ -1222,14 +1230,21 @@ import Foundation
             options: ResolvedGenerationOptions
         ) -> AsyncThrowingStream<String, Error> {
             return AsyncThrowingStream { continuation in
-                self.performTextGeneration(
-                    context: context,
-                    model: model,
-                    prompt: prompt,
-                    maxTokens: maxTokens,
-                    options: options,
-                    continuation: continuation
-                )
+                let sendableContext = SendableOpaquePointer(context)
+                let sendableModel = SendableOpaquePointer(model)
+                let task = Task {
+                    self.performTextGeneration(
+                        context: sendableContext.value,
+                        model: sendableModel.value,
+                        prompt: prompt,
+                        maxTokens: maxTokens,
+                        options: options,
+                        continuation: continuation
+                    )
+                }
+                continuation.onTermination = { _ in
+                    task.cancel()
+                }
             }
         }
 
@@ -1304,6 +1319,10 @@ import Foundation
                 var n_cur: Int32 = hasEncoder ? 1 : batch.n_tokens
 
                 for _ in 0 ..< maxTokens {
+                    if Task.isCancelled {
+                        break
+                    }
+
                     // Sample next token from logits of the last token we just decoded
                     let nextToken = llama_sampler_sample(sampler, context, batch.n_tokens - 1)
                     llama_sampler_accept(sampler, nextToken)
@@ -1579,13 +1598,26 @@ import Foundation
             options: ResolvedGenerationOptions
         ) -> AsyncThrowingStream<String, Error> {
             AsyncThrowingStream { continuation in
-                do {
-                    try generateFromPrefilledContext(context: context, model: model, nPast: nPast, maxTokens: maxTokens, options: options) { tokenText in
-                        continuation.yield(tokenText)
+                let sendableContext = SendableOpaquePointer(context)
+                let sendableModel = SendableOpaquePointer(model)
+                let task = Task {
+                    do {
+                        try generateFromPrefilledContext(
+                            context: sendableContext.value,
+                            model: sendableModel.value,
+                            nPast: nPast,
+                            maxTokens: maxTokens,
+                            options: options
+                        ) { tokenText in
+                            continuation.yield(tokenText)
+                        }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
                     }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+                }
+                continuation.onTermination = { _ in
+                    task.cancel()
                 }
             }
         }
@@ -1626,6 +1658,10 @@ import Foundation
 
             var currentPosition = nPast
             for _ in 0 ..< maxTokens {
+                if Task.isCancelled {
+                    break
+                }
+
                 let nextToken = llama_sampler_sample(sampler, context, -1)
                 llama_sampler_accept(sampler, nextToken)
 
