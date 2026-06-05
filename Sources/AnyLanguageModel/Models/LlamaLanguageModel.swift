@@ -1124,133 +1124,42 @@ import Foundation
             llama_sampler_chain_add(sampler, llama_sampler_init_dist(options.seed))
         }
 
-        private struct TokenSequenceMatcher {
-            private let tokens: [llama_token]
-            private var position = 0
-
-            init(tokens: [llama_token]) {
-                self.tokens = tokens
-            }
-
-            mutating func accept(_ token: llama_token) -> Bool {
-                guard !tokens.isEmpty else { return false }
-
-                if token == tokens[position] {
-                    position += 1
-                    if position >= tokens.count {
-                        position = 0
-                        return true
-                    }
-                    return false
-                }
-
-                position = token == tokens[0] ? 1 : 0
-                return false
-            }
-
-            mutating func reset() {
-                position = 0
-            }
-        }
-
-        private struct ThinkingBudgetController {
-            private enum State {
-                case idle
-                case counting
-                case done
-            }
-
-            private let budget: Int
-            private let endTokens: [llama_token]
-            private var remaining: Int
-            private var state: State
-            private var startMatcher: TokenSequenceMatcher
-            private var endMatcher: TokenSequenceMatcher
-            private var forcedTokens: [llama_token] = []
-            private var forcedIndex = 0
-
-            init(
-                startTokens: [llama_token],
-                endTokens: [llama_token],
-                budget: Int,
-                startsInsideThinking: Bool
-            ) {
-                self.budget = max(0, budget)
-                self.endTokens = endTokens
-                self.remaining = max(0, budget)
-                self.state = startsInsideThinking ? .counting : .idle
-                self.startMatcher = TokenSequenceMatcher(tokens: startTokens)
-                self.endMatcher = TokenSequenceMatcher(tokens: endTokens)
-            }
-
-            mutating func nextForcedToken() -> llama_token? {
-                guard forcedIndex < forcedTokens.count else { return nil }
-                let token = forcedTokens[forcedIndex]
-                forcedIndex += 1
-                if forcedIndex >= forcedTokens.count {
-                    forcedTokens.removeAll()
-                    forcedIndex = 0
-                }
-                return token
-            }
-
-            mutating func accept(_ token: llama_token) {
-                switch state {
-                case .idle:
-                    if startMatcher.accept(token) {
-                        state = .counting
-                        remaining = budget
-                        endMatcher.reset()
-                        if remaining <= 0 {
-                            forceThinkingEnd()
-                        }
-                    }
-
-                case .counting:
-                    if endMatcher.accept(token) {
-                        state = .done
-                        return
-                    }
-
-                    guard forcedTokens.isEmpty else { return }
-                    remaining -= 1
-                    if remaining <= 0 {
-                        forceThinkingEnd()
-                    }
-
-                case .done:
-                    break
-                }
-            }
-
-            private mutating func forceThinkingEnd() {
-                guard !endTokens.isEmpty else {
-                    state = .done
-                    return
-                }
-                forcedTokens = endTokens
-                forcedIndex = 0
-                state = .done
-            }
-        }
-
-        private func makeThinkingBudgetController(
+        private func addThinkingBudgetSampler(
+            to sampler: UnsafeMutablePointer<llama_sampler>,
             vocab: OpaquePointer,
             options: ResolvedGenerationOptions
-        ) -> ThinkingBudgetController {
-            guard let budget = options.thinkingBudgetTokens else {
-                return ThinkingBudgetController(startTokens: [], endTokens: [], budget: Int.max, startsInsideThinking: false)
-            }
+        ) {
+            guard let budget = options.thinkingBudgetTokens else { return }
 
             let startTokens = (try? tokenizeText(vocab: vocab, text: "<think>", addSpecial: false)) ?? []
-            let endTokens = (try? tokenizeText(vocab: vocab, text: "</think>\n\n", addSpecial: false)) ?? []
-            let startsInsideThinking = options.thinkingMode == .forced
-            return ThinkingBudgetController(
-                startTokens: startTokens,
-                endTokens: endTokens,
-                budget: budget,
-                startsInsideThinking: startsInsideThinking
-            )
+            let endTokens = (try? tokenizeText(vocab: vocab, text: "</think>", addSpecial: false)) ?? []
+            let forcedTokens = (try? tokenizeText(vocab: vocab, text: "</think>\n\n", addSpecial: false)) ?? []
+            guard !endTokens.isEmpty, !forcedTokens.isEmpty else { return }
+
+            let initialState: llama_swift_reasoning_budget_state = options.thinkingMode == .forced
+                ? LLAMA_SWIFT_REASONING_BUDGET_COUNTING
+                : LLAMA_SWIFT_REASONING_BUDGET_IDLE
+
+            startTokens.withUnsafeBufferPointer { startPtr in
+                endTokens.withUnsafeBufferPointer { endPtr in
+                    forcedTokens.withUnsafeBufferPointer { forcedPtr in
+                        guard let budgetSampler = llama_swift_sampler_init_reasoning_budget(
+                            vocab,
+                            startPtr.baseAddress,
+                            Int32(startTokens.count),
+                            endPtr.baseAddress,
+                            Int32(endTokens.count),
+                            forcedPtr.baseAddress,
+                            Int32(forcedTokens.count),
+                            Int32(max(0, budget)),
+                            initialState
+                        ) else {
+                            return
+                        }
+                        llama_sampler_chain_add(sampler, budgetSampler)
+                    }
+                }
+            }
         }
 
         private struct SendableOpaquePointer: @unchecked Sendable {
@@ -1319,9 +1228,8 @@ import Foundation
                 )
             }
 
+            addThinkingBudgetSampler(to: samplerPtr, vocab: vocab, options: options)
             applySampling(sampler: samplerPtr, effectiveTemperature: effectiveTemperature, options: options)
-
-            var thinkingBudget = makeThinkingBudgetController(vocab: vocab, options: options)
 
             // Generate tokens one by one
             var generatedText = ""
@@ -1330,10 +1238,8 @@ import Foundation
             var n_cur: Int32 = hasEncoder ? 1 : batch.n_tokens
 
             for _ in 0 ..< maxTokens {
-                // Sample next token from logits, or force a reasoning end token when the
-                // thinking budget has been exhausted.
-                let nextToken = thinkingBudget.nextForcedToken()
-                    ?? llama_sampler_sample(sampler, context, batch.n_tokens - 1)
+                // Sample next token from logits - llama_batch_get_one creates batch with single token at index 0
+                let nextToken = llama_sampler_sample(sampler, context, batch.n_tokens - 1)
                 llama_sampler_accept(sampler, nextToken)
 
                 // Check for end of sequence
@@ -1345,7 +1251,6 @@ import Foundation
                 if let tokenText = tokenToText(vocab: vocab, token: nextToken) {
                     generatedText += tokenText
                 }
-                thinkingBudget.accept(nextToken)
 
                 // Prepare batch for next token
                 batch.n_tokens = 1
@@ -1456,6 +1361,7 @@ import Foundation
                     )
                 }
 
+                addThinkingBudgetSampler(to: samplerPtr, vocab: vocab, options: options)
                 // Check for mirostat sampling (takes precedence over standard sampling)
                 applySampling(sampler: samplerPtr, effectiveTemperature: effectiveTemperature, options: options)
 
@@ -1463,17 +1369,14 @@ import Foundation
                 // Track position - for encoder-decoder models, we start from position 1 (after decoder start token)
                 // For decoder-only models, we continue from the end of the prompt
                 var n_cur: Int32 = hasEncoder ? 1 : batch.n_tokens
-                var thinkingBudget = makeThinkingBudgetController(vocab: vocab, options: options)
 
                 for _ in 0 ..< maxTokens {
                     if Task.isCancelled {
                         break
                     }
 
-                    // Sample next token from logits, or force a reasoning end token when the
-                    // thinking budget has been exhausted.
-                    let nextToken = thinkingBudget.nextForcedToken()
-                        ?? llama_sampler_sample(sampler, context, batch.n_tokens - 1)
+                    // Sample next token from logits of the last token we just decoded
+                    let nextToken = llama_sampler_sample(sampler, context, batch.n_tokens - 1)
                     llama_sampler_accept(sampler, nextToken)
 
                     // Check for end of sequence
@@ -1485,7 +1388,6 @@ import Foundation
                     if let tokenText = tokenToText(vocab: vocab, token: nextToken) {
                         continuation.yield(tokenText)
                     }
-                    thinkingBudget.accept(nextToken)
 
                     // Prepare batch for next token
                     batch.n_tokens = 1
@@ -1804,6 +1706,7 @@ import Foundation
                     )
                 )
             }
+            addThinkingBudgetSampler(to: samplerPtr, vocab: vocab, options: options)
             applySampling(sampler: samplerPtr, effectiveTemperature: Float(options.temperature), options: options)
 
             var currentPosition = nPast
