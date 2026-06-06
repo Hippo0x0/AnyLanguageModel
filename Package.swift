@@ -31,7 +31,10 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
         .package(url: "https://github.com/mattt/EventSource", from: "1.3.0"),
         .package(url: "https://github.com/mattt/JSONSchema", from: "1.3.0"),
-        .package(path: "../llama.swift"),
+        .package(
+            url: "git@github.com:Hippo0x0/llama.swift.git",
+            branch: "experiment/llama-swift-thinking-budget"
+        ),
         .package(url: "https://github.com/mattt/PartialJSONDecoder", from: "1.0.0"),
         // mlx-swift-lm must be >= 2.25.5 for ToolSpec/tool calls and UserInput(chat:processing:tools:).
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "2.25.5"),
