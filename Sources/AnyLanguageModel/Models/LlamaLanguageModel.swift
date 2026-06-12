@@ -1845,10 +1845,6 @@ import Foundation
         }
 
         private func formatPrompt(for session: LanguageModelSession) throws -> String {
-            guard let model = self.model else {
-                throw LlamaLanguageModelError.modelLoadFailed
-            }
-
             var messages: [(role: String, content: String)] = []
 
             for entry in session.transcript {
@@ -1876,6 +1872,14 @@ import Foundation
                 }
             }
 
+            return try applyChatTemplate(to: messages)
+        }
+
+        private func applyChatTemplate(to messages: [(role: String, content: String)]) throws -> String {
+            guard let model = self.model else {
+                throw LlamaLanguageModelError.modelLoadFailed
+            }
+
             // Keep C strings alive while using them
             let cRoles = messages.map { strdup($0.role) }
             let cContents = messages.map { strdup($0.content) }
@@ -1890,12 +1894,8 @@ import Foundation
                 cMessages.append(llama_chat_message(role: cRoles[i], content: cContents[i]))
             }
 
-            // Get chat template embedded in the model's GGUF file (e.g., Llama 3, Mistral, ChatML)
-            let tmpl = llama_model_chat_template(model, nil)
-
-            // Get required buffer size
-            let requiredSize = llama_chat_apply_template(
-                tmpl,
+            let jinjaRequiredSize = llama_chat_apply_template_jinja(
+                model,
                 cMessages,
                 cMessages.count,
                 true,  // add_ass: Add assistant generation prompt
@@ -1903,24 +1903,47 @@ import Foundation
                 0
             )
 
-            guard requiredSize > 0 else {
-                throw LlamaLanguageModelError.encodingFailed
+            if jinjaRequiredSize > 0 {
+                var buffer = [CChar](repeating: 0, count: Int(jinjaRequiredSize) + 1)
+                let result = llama_chat_apply_template_jinja(
+                    model,
+                    cMessages,
+                    cMessages.count,
+                    true,
+                    &buffer,
+                    Int32(buffer.count)
+                )
+
+                if result > 0 {
+                    return buffer.withUnsafeBytes { rawBuffer in
+                        String(decoding: rawBuffer.prefix(Int(result)), as: UTF8.self)
+                    }
+                }
+
+                print("[LlamaLanguageModel] jinja chat template failed result=\(result); trying legacy template")
+            } else {
+                print("[LlamaLanguageModel] jinja chat template failed requiredSize=\(jinjaRequiredSize); trying legacy template")
             }
 
-            // Allocate buffer and apply template
-            var buffer = [CChar](repeating: 0, count: Int(requiredSize) + 1)
+            // Get chat template embedded in the model's GGUF file (e.g., Llama 3, Mistral, ChatML)
+            let tmpl = llama_model_chat_template(model, nil)
+            let requiredSize = llama_chat_apply_template(tmpl, cMessages, cMessages.count, true, nil, 0)
 
-            let result = llama_chat_apply_template(
-                tmpl,
-                cMessages,
-                cMessages.count,
-                true,
-                &buffer,
-                Int32(buffer.count)
-            )
+            guard requiredSize > 0 else {
+                return fallbackPrompt(
+                    from: messages,
+                    reason: "jinjaRequiredSize=\(jinjaRequiredSize) legacyRequiredSize=\(requiredSize)"
+                )
+            }
+
+            var buffer = [CChar](repeating: 0, count: Int(requiredSize) + 1)
+            let result = llama_chat_apply_template(tmpl, cMessages, cMessages.count, true, &buffer, Int32(buffer.count))
 
             guard result > 0 else {
-                throw LlamaLanguageModelError.encodingFailed
+                return fallbackPrompt(
+                    from: messages,
+                    reason: "jinjaRequiredSize=\(jinjaRequiredSize) legacyResult=\(result)"
+                )
             }
 
             return buffer.withUnsafeBytes { rawBuffer in
@@ -1928,41 +1951,27 @@ import Foundation
             }
         }
 
-        private func applyChatTemplate(to messages: [(role: String, content: String)]) throws -> String {
-            guard let model = self.model else {
-                throw LlamaLanguageModelError.modelLoadFailed
+        private func fallbackPrompt(from messages: [(role: String, content: String)], reason: String) -> String {
+            let roleSummary = messages.map { "\($0.role):\($0.content.count)" }.joined(separator: ",")
+            print("[LlamaLanguageModel] chat template failed \(reason); falling back to plain prompt roles=[\(roleSummary)]")
+
+            var sections: [String] = []
+            for message in messages {
+                let roleLabel: String
+                switch message.role {
+                case "system":
+                    roleLabel = "System"
+                case "user":
+                    roleLabel = "User"
+                case "assistant":
+                    roleLabel = "Assistant"
+                default:
+                    roleLabel = message.role.capitalized
+                }
+                sections.append("\(roleLabel):\n\(message.content)")
             }
-
-            let cRoles = messages.map { strdup($0.role) }
-            let cContents = messages.map { strdup($0.content) }
-
-            defer {
-                cRoles.forEach { free($0) }
-                cContents.forEach { free($0) }
-            }
-
-            var cMessages = [llama_chat_message]()
-            for i in 0 ..< messages.count {
-                cMessages.append(llama_chat_message(role: cRoles[i], content: cContents[i]))
-            }
-
-            let tmpl = llama_model_chat_template(model, nil)
-            let requiredSize = llama_chat_apply_template(tmpl, cMessages, cMessages.count, true, nil, 0)
-
-            guard requiredSize > 0 else {
-                throw LlamaLanguageModelError.encodingFailed
-            }
-
-            var buffer = [CChar](repeating: 0, count: Int(requiredSize) + 1)
-            let result = llama_chat_apply_template(tmpl, cMessages, cMessages.count, true, &buffer, Int32(buffer.count))
-
-            guard result > 0 else {
-                throw LlamaLanguageModelError.encodingFailed
-            }
-
-            return buffer.withUnsafeBytes { rawBuffer in
-                String(decoding: rawBuffer.prefix(Int(result)), as: UTF8.self)
-            }
+            sections.append("Assistant:\n")
+            return sections.joined(separator: "\n\n")
         }
 
         /// Strip the pre-filled empty think block that Qwen3.5 templates insert when
