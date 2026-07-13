@@ -1,7 +1,5 @@
 import Foundation
-import Observation
 
-@Observable
 public final class LanguageModelSession: @unchecked Sendable {
     public private(set) var isResponding: Bool = false
     public private(set) var transcript: Transcript
@@ -10,7 +8,7 @@ public final class LanguageModelSession: @unchecked Sendable {
     public let tools: [any Tool]
     public let instructions: Instructions?
 
-    @ObservationIgnored private let respondingState = RespondingState()
+    private let respondingState = RespondingState()
 
     public convenience init(
         model: any LanguageModel,
