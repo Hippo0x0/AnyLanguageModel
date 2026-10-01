@@ -33,7 +33,7 @@ let package = Package(
         .package(url: "https://github.com/mattt/JSONSchema", from: "1.3.0"),
         .package(
             url: "git@github.com:Hippo0x0/llama.swift.git",
-            branch: "experiment/llama-swift-thinking-budget"
+            branch: "copytain-ios-vision-memory"
         ),
         .package(url: "https://github.com/mattt/PartialJSONDecoder", from: "1.0.0"),
         // mlx-swift-lm must be >= 2.25.5 for ToolSpec/tool calls and UserInput(chat:processing:tools:).

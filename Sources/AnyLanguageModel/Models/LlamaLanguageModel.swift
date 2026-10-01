@@ -892,6 +892,7 @@ import Foundation
             var mtmdParams = mtmd_context_params_default()
             mtmdParams.use_gpu = runtimeOptions.mmprojUseGPU
             mtmdParams.print_timings = false
+            mtmdParams.warmup = false
             mtmdParams.n_threads = runtimeOptions.threads
             mtmdParams.image_min_tokens = runtimeOptions.imageMinTokens ?? -1
             mtmdParams.image_max_tokens = runtimeOptions.imageMaxTokens ?? -1
@@ -1475,6 +1476,7 @@ import Foundation
             var mtmdParams = mtmd_context_params_default()
             mtmdParams.use_gpu = options.mmprojUseGPU
             mtmdParams.print_timings = false
+            mtmdParams.warmup = false
             mtmdParams.n_threads = options.threads
             mtmdParams.image_min_tokens = options.imageMinTokens ?? -1
             mtmdParams.image_max_tokens = options.imageMaxTokens ?? -1
