@@ -1274,7 +1274,14 @@ import Foundation
             var generatedText = ""
             // Track position - for encoder-decoder models, we start from position 1 (after decoder start token)
             // For decoder-only models, we continue from the end of the prompt
-            var n_cur: Int32 = hasEncoder ? 1 : batch.n_tokens
+            // prepareInitialBatch may split a long prompt into multiple
+            // micro-batches. `batch.n_tokens` is then only the size of the
+            // final chunk, while llama.cpp expects the next position to follow
+            // the complete prompt in the KV cache.
+            var n_cur = Self.nextDecodePosition(
+                hasEncoder: hasEncoder,
+                promptTokenCount: promptTokens.count
+            )
 
             for _ in 0 ..< maxTokens {
                 // Sample next token from logits - llama_batch_get_one creates batch with single token at index 0
@@ -1407,7 +1414,13 @@ import Foundation
                 // Generate tokens one by one
                 // Track position - for encoder-decoder models, we start from position 1 (after decoder start token)
                 // For decoder-only models, we continue from the end of the prompt
-                var n_cur: Int32 = hasEncoder ? 1 : batch.n_tokens
+                // `batch.n_tokens` contains only the final prompt chunk after
+                // chunked prefill. Continue at the full prompt length so the
+                // sequence positions remain contiguous in llama.cpp.
+                var n_cur = Self.nextDecodePosition(
+                    hasEncoder: hasEncoder,
+                    promptTokenCount: promptTokens.count
+                )
 
                 for _ in 0 ..< maxTokens {
                     if Task.isCancelled {
@@ -1784,6 +1797,10 @@ import Foundation
         }
 
         // MARK: - Helper Methods
+
+        static func nextDecodePosition(hasEncoder: Bool, promptTokenCount: Int) -> Int32 {
+            hasEncoder ? 1 : Int32(promptTokenCount)
+        }
 
         /// Prepares the initial batch for text generation, handling encoder-decoder vs decoder-only models.
         ///

@@ -6,6 +6,11 @@ import Testing
 #if Llama
     @Suite("LlamaLanguageModel multimodal configuration")
     struct LlamaLanguageModelMultimodalConfigurationTests {
+        @Test func chunkedPromptContinuesAfterTheCompletePrompt() {
+            #expect(LlamaLanguageModel.nextDecodePosition(hasEncoder: false, promptTokenCount: 331) == 331)
+            #expect(LlamaLanguageModel.nextDecodePosition(hasEncoder: true, promptTokenCount: 331) == 1)
+        }
+
         @Test func initializerStoresProjectorPath() {
             let model = LlamaLanguageModel(
                 modelPath: "/models/text.gguf",
