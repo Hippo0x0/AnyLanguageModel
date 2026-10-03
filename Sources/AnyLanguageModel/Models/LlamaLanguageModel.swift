@@ -79,6 +79,21 @@ import Foundation
         /// )
         /// ```
         public struct CustomGenerationOptions: AnyLanguageModel.CustomGenerationOptions, Codable {
+            /// An OpenAI-compatible tool definition passed to llama.cpp's
+            /// native chat-template pipeline. `parametersJSON` must contain a
+            /// JSON Schema object.
+            public struct ChatToolDefinition: Hashable, Codable, Sendable {
+                public var name: String
+                public var description: String
+                public var parametersJSON: String
+
+                public init(name: String, description: String, parametersJSON: String) {
+                    self.name = name
+                    self.description = description
+                    self.parametersJSON = parametersJSON
+                }
+            }
+
             public enum ThinkingMode: String, Codable, Sendable {
                 /// Preserve the model template's no-thinking behavior.
                 case disabled
@@ -184,6 +199,11 @@ import Foundation
             /// continues normal answer generation.
             public var thinkingBudgetTokens: Int?
 
+            /// Additional tools to expose to local chat templates. This is
+            /// useful when the host app owns confirmation/execution instead of
+            /// allowing LanguageModelSession to invoke a Tool directly.
+            public var chatTools: [ChatToolDefinition]?
+
             /// Creates custom generation options for llama.cpp.
             public init(
                 contextSize: UInt32? = nil,
@@ -208,7 +228,8 @@ import Foundation
                 bannedTokens: [llama_token]? = nil,
                 enableThinking: Bool? = nil,
                 thinkingMode: ThinkingMode? = nil,
-                thinkingBudgetTokens: Int? = nil
+                thinkingBudgetTokens: Int? = nil,
+                chatTools: [ChatToolDefinition]? = nil
             ) {
                 self.contextSize = contextSize
                 self.batchSize = batchSize
@@ -233,6 +254,7 @@ import Foundation
                 self.enableThinking = enableThinking
                 self.thinkingMode = thinkingMode
                 self.thinkingBudgetTokens = thinkingBudgetTokens
+                self.chatTools = chatTools
             }
 
             /// Default llama.cpp options used when none are provided at runtime.
@@ -406,6 +428,7 @@ import Foundation
             var enableThinking: Bool
             var thinkingMode: CustomGenerationOptions.ThinkingMode
             var thinkingBudgetTokens: Int?
+            var chatTools: [CustomGenerationOptions.ChatToolDefinition]
 
             init(
                 contextSize: UInt32 = 2048,
@@ -432,7 +455,8 @@ import Foundation
                 bannedTokens: [llama_token]? = nil,
                 enableThinking: Bool = false,
                 thinkingMode: CustomGenerationOptions.ThinkingMode = .disabled,
-                thinkingBudgetTokens: Int? = nil
+                thinkingBudgetTokens: Int? = nil,
+                chatTools: [CustomGenerationOptions.ChatToolDefinition] = []
             ) {
                 self.contextSize = contextSize
                 self.batchSize = batchSize
@@ -459,6 +483,7 @@ import Foundation
                 self.enableThinking = enableThinking
                 self.thinkingMode = thinkingMode
                 self.thinkingBudgetTokens = thinkingBudgetTokens
+                self.chatTools = chatTools
             }
 
             init(
@@ -506,7 +531,8 @@ import Foundation
                         bannedTokens: base.bannedTokens,
                         enableThinking: base.enableThinking,
                         thinkingMode: base.thinkingMode,
-                        thinkingBudgetTokens: base.thinkingBudgetTokens
+                        thinkingBudgetTokens: base.thinkingBudgetTokens,
+                        chatTools: base.chatTools
                     )
                     return
                 }
@@ -537,6 +563,7 @@ import Foundation
                 self.thinkingMode = options.thinkingMode
                     ?? (options.enableThinking == true ? .auto : base.thinkingMode)
                 self.thinkingBudgetTokens = options.thinkingBudgetTokens ?? base.thinkingBudgetTokens
+                self.chatTools = options.chatTools ?? base.chatTools
             }
         }
 
@@ -654,16 +681,18 @@ import Foundation
                     options: runtimeOptions
                 )
             } else {
-                var fullPrompt = try formatPrompt(for: session)
+                let template = try formatPrompt(for: session, options: runtimeOptions)
+                var fullPrompt = template.prompt
                 let thinkingPrefix: String
                 (fullPrompt, thinkingPrefix) = applyThinkingMode(runtimeOptions.thinkingMode, to: fullPrompt)
-                text = try await generateText(
+                let generatedText = try await generateText(
                     context: context,
                     model: model!,
                     prompt: fullPrompt,
                     maxTokens: maxTokens,
                     options: runtimeOptions
                 )
+                text = normalizeParsedResponse(generatedText, parserState: template.parserState)
                 if !thinkingPrefix.isEmpty {
                     return LanguageModelSession.Response(
                         content: (thinkingPrefix + text) as! Content,
@@ -737,7 +766,8 @@ import Foundation
                                         options: runtimeOptions
                                     )
                                 } else {
-                                    var fullPrompt = try self.formatPrompt(for: session)
+                                    let template = try self.formatPrompt(for: session, options: runtimeOptions)
+                                    var fullPrompt = template.prompt
                                     let thinkingPrefix: String
                                     (fullPrompt, thinkingPrefix) = self.applyThinkingMode(runtimeOptions.thinkingMode, to: fullPrompt)
                                     if !thinkingPrefix.isEmpty {
@@ -765,6 +795,21 @@ import Foundation
                                         rawContent: GeneratedContent(accumulatedText)
                                     )
                                     continuation.yield(snapshot)
+                                }
+
+                                if !hasImages {
+                                    let template = try self.formatPrompt(for: session, options: runtimeOptions)
+                                    let parsedText = self.normalizeParsedResponse(
+                                        accumulatedText,
+                                        parserState: template.parserState
+                                    )
+                                    if parsedText != accumulatedText {
+                                        accumulatedText = parsedText
+                                        continuation.yield(.init(
+                                            content: (parsedText as! Content).asPartiallyGenerated(),
+                                            rawContent: GeneratedContent(parsedText)
+                                        ))
+                                    }
                                 }
                             } catch {
                                 continuation.finish(throwing: error)
@@ -1844,7 +1889,19 @@ import Foundation
             return hasEncoder
         }
 
-        private func formatPrompt(for session: LanguageModelSession) throws -> String {
+        private struct ChatTemplateApplication {
+            let prompt: String
+            let parserState: String?
+        }
+
+        private func formatPrompt(
+            for session: LanguageModelSession,
+            options: ResolvedGenerationOptions
+        ) throws -> ChatTemplateApplication {
+            if let application = try applyStructuredChatTemplate(to: session, options: options) {
+                return application
+            }
+
             var messages: [(role: String, content: String)] = []
 
             for entry in session.transcript {
@@ -1872,7 +1929,213 @@ import Foundation
                 }
             }
 
-            return try applyChatTemplate(to: messages)
+            return ChatTemplateApplication(prompt: try applyChatTemplate(to: messages), parserState: nil)
+        }
+
+        private func applyStructuredChatTemplate(
+            to session: LanguageModelSession,
+            options: ResolvedGenerationOptions
+        ) throws -> ChatTemplateApplication? {
+            guard let model else { throw LlamaLanguageModelError.modelLoadFailed }
+
+            var messages: [[String: Any]] = []
+            for entry in session.transcript {
+                switch entry {
+                case .instructions(let instructions):
+                    let content = extractText(from: instructions.segments)
+                    if !content.isEmpty {
+                        messages.append(["role": "system", "content": content])
+                    }
+                case .prompt(let prompt):
+                    let content = extractText(from: prompt.segments)
+                    if let toolMessage = parseToolResponseMessage(content) {
+                        messages.append(toolMessage)
+                    } else if !content.isEmpty {
+                        messages.append(["role": "user", "content": content])
+                    }
+                case .response(let response):
+                    let content = extractText(from: response.segments)
+                    let parsed = parseCanonicalToolCalls(content)
+                    if parsed.calls.isEmpty {
+                        if !content.isEmpty {
+                            messages.append(["role": "assistant", "content": content])
+                        }
+                    } else {
+                        messages.append([
+                            "role": "assistant",
+                            "content": parsed.content,
+                            "tool_calls": parsed.calls,
+                        ])
+                    }
+                case .toolCalls(let toolCalls):
+                    let calls: [[String: Any]] = toolCalls.map { call in
+                        [
+                            "id": call.id,
+                            "type": "function",
+                            "function": [
+                                "name": call.toolName,
+                                "arguments": jsonObject(from: call.arguments.jsonString) ?? [:],
+                            ],
+                        ]
+                    }
+                    messages.append(["role": "assistant", "content": "", "tool_calls": calls])
+                case .toolOutput(let output):
+                    messages.append([
+                        "role": "tool",
+                        "name": output.toolName,
+                        "tool_call_id": output.id,
+                        "content": extractText(from: output.segments),
+                    ])
+                }
+            }
+
+            var tools: [[String: Any]] = options.chatTools.compactMap { definition in
+                guard let parameters = jsonObject(from: definition.parametersJSON) else { return nil }
+                return [
+                    "type": "function",
+                    "function": [
+                        "name": definition.name,
+                        "description": definition.description,
+                        "parameters": parameters,
+                    ],
+                ]
+            }
+
+            for entry in session.transcript {
+                guard case .instructions(let instructions) = entry else { continue }
+                for definition in instructions.toolDefinitions {
+                    let data = try JSONEncoder().encode(definition.parameters)
+                    guard let parameters = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                        continue
+                    }
+                    tools.append([
+                        "type": "function",
+                        "function": [
+                            "name": definition.name,
+                            "description": definition.description,
+                            "parameters": parameters,
+                        ],
+                    ])
+                }
+            }
+
+            let messagesData = try JSONSerialization.data(withJSONObject: messages)
+            let toolsData = try JSONSerialization.data(withJSONObject: tools)
+            guard let messagesJSON = String(data: messagesData, encoding: .utf8),
+                  let toolsJSON = String(data: toolsData, encoding: .utf8) else {
+                return nil
+            }
+
+            let required = messagesJSON.withCString { messagesPointer in
+                toolsJSON.withCString { toolsPointer in
+                    llama_chat_apply_template_jinja_oaicompat(
+                        model, messagesPointer, toolsPointer, true, options.enableThinking, nil, 0
+                    )
+                }
+            }
+            guard required > 0 else {
+                print("[LlamaLanguageModel] structured jinja template failed requiredSize=\(required); trying compatibility path")
+                return nil
+            }
+
+            var buffer = [CChar](repeating: 0, count: Int(required) + 1)
+            let result = messagesJSON.withCString { messagesPointer in
+                toolsJSON.withCString { toolsPointer in
+                    llama_chat_apply_template_jinja_oaicompat(
+                        model, messagesPointer, toolsPointer, true, options.enableThinking,
+                        &buffer, Int32(buffer.count)
+                    )
+                }
+            }
+            guard result > 0 else { return nil }
+            let stateJSON = buffer.withUnsafeBytes {
+                String(decoding: $0.prefix(Int(result)), as: UTF8.self)
+            }
+            guard let state = jsonObject(from: stateJSON), let prompt = state["prompt"] as? String else {
+                return nil
+            }
+            return ChatTemplateApplication(prompt: prompt, parserState: stateJSON)
+        }
+
+        private func normalizeParsedResponse(_ response: String, parserState: String?) -> String {
+            guard let parserState else { return response }
+            let required = parserState.withCString { statePointer in
+                response.withCString { responsePointer in
+                    llama_chat_parse_response_jinja_oaicompat(
+                        statePointer, responsePointer, false, nil, 0
+                    )
+                }
+            }
+            guard required > 0 else { return response }
+
+            var buffer = [CChar](repeating: 0, count: Int(required) + 1)
+            let result = parserState.withCString { statePointer in
+                response.withCString { responsePointer in
+                    llama_chat_parse_response_jinja_oaicompat(
+                        statePointer, responsePointer, false, &buffer, Int32(buffer.count)
+                    )
+                }
+            }
+            guard result > 0 else { return response }
+            let parsedJSON = buffer.withUnsafeBytes {
+                String(decoding: $0.prefix(Int(result)), as: UTF8.self)
+            }
+            guard let parsed = jsonObject(from: parsedJSON),
+                  let calls = parsed["tool_calls"] as? [[String: Any]], !calls.isEmpty else {
+                return response
+            }
+
+            var parts: [String] = []
+            if let reasoning = parsed["reasoning_content"] as? String, !reasoning.isEmpty {
+                parts.append("<think>\n\(reasoning)\n</think>")
+            }
+            if let content = parsed["content"] as? String, !content.isEmpty {
+                parts.append(content)
+            }
+            for call in calls {
+                guard JSONSerialization.isValidJSONObject(call),
+                      let data = try? JSONSerialization.data(withJSONObject: call),
+                      let json = String(data: data, encoding: .utf8) else { continue }
+                parts.append("<tool_call>\(json)</tool_call>")
+            }
+            return parts.joined(separator: "\n")
+        }
+
+        private func parseCanonicalToolCalls(_ text: String) -> (content: String, calls: [[String: Any]]) {
+            guard let regex = try? NSRegularExpression(
+                pattern: #"<\s*tool[_-]?call\s*/?\s*>(.*?)</\s*tool[_-]?call\s*>"#,
+                options: [.caseInsensitive, .dotMatchesLineSeparators]
+            ) else { return (text, []) }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            let matches = regex.matches(in: text, range: range)
+            let calls = matches.compactMap { match -> [String: Any]? in
+                guard let bodyRange = Range(match.range(at: 1), in: text) else { return nil }
+                return jsonObject(from: String(text[bodyRange]))
+            }
+            guard !calls.isEmpty else { return (text, []) }
+            let content = regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (content, calls)
+        }
+
+        private func parseToolResponseMessage(_ text: String) -> [String: Any]? {
+            let gemmaPattern = #"^\s*<\|tool_response>response:([^\{]+)\{output:<\|\"\|>(.*?)<\|\"\|>\}<tool_response\|>\s*$"#
+            if let regex = try? NSRegularExpression(pattern: gemmaPattern, options: [.dotMatchesLineSeparators]),
+               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)),
+               let nameRange = Range(match.range(at: 1), in: text),
+               let outputRange = Range(match.range(at: 2), in: text) {
+                return [
+                    "role": "tool",
+                    "name": String(text[nameRange]),
+                    "content": String(text[outputRange]),
+                ]
+            }
+            return nil
+        }
+
+        private func jsonObject(from string: String) -> [String: Any]? {
+            guard let data = string.data(using: .utf8) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         }
 
         private func applyChatTemplate(to messages: [(role: String, content: String)]) throws -> String {
